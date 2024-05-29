@@ -30,27 +30,46 @@ class MaxPool1d:
         
         return Tensor(out)
 
+# Custom MoRA layer
+class MoRA:
+    def __init__(self, input_dim, output_dim):
+        self.high_rank_matrix = Tensor.uniform(input_dim, output_dim)
+    
+    def __call__(self, x):
+        return x @ self.high_rank_matrix
+
+# Retriever class with MoRA integration
 class Retriever:
     def __init__(self, data_store, embedding_dim=300, hidden_dim=256, num_layers=3, conv_channels=128, conv_kernel_size=3, pool_kernel_size=2):
         self.data_store = data_store
         self.vocab = self._build_vocab(data_store)
         self.embedding = Embedding(len(self.vocab), embedding_dim)
+        
+        # Building convolutional layers with MoRA
         self.conv_layers = []
+        self.mora_layers = []
         for _ in range(num_layers):
-            self.conv_layers.append(Conv1d(embedding_dim, conv_channels, conv_kernel_size, stride=1, padding=conv_kernel_size//2))
+            self.conv_layers.append(Conv1d(embedding_dim, conv_channels, conv_kernel_size, stride=1, padding=conv_kernel_size // 2))
             self.conv_layers.append(ReLU)
             self.conv_layers.append(MaxPool1d(pool_kernel_size))
             self.conv_layers.append(BatchNorm2d(conv_channels))
+            self.mora_layers.append(MoRA(conv_channels, conv_channels))
             embedding_dim = conv_channels
+        
+        # Building encoder layers with MoRA
         self.encoder_layers = []
         for _ in range(num_layers):
             self.encoder_layers.append(Linear(embedding_dim, hidden_dim))
             self.encoder_layers.append(BatchNorm2d(hidden_dim))
             self.encoder_layers.append(ReLU)
+            self.mora_layers.append(MoRA(hidden_dim, hidden_dim))
             embedding_dim = hidden_dim
+        
+        # Attention layer
         self.attention = Linear(hidden_dim, 1)
         self.softmax = Softmax
     
+    # Build vocabulary from data store
     def _build_vocab(self, data_store):
         vocab = {}
         for doc in data_store:
@@ -59,26 +78,37 @@ class Retriever:
                     vocab[word] = len(vocab)
         return vocab
     
+    # Encode text using embedding, convolutional layers, and MoRA layers
     def _encode(self, text):
         indices = [self.vocab.get(word, 0) for word in text.lower().split()]
         embeddings = self.embedding(Tensor(indices)).unsqueeze(0).unsqueeze(0)
         hidden = embeddings
-        for layer in self.conv_layers:
-            hidden = layer(hidden)
+        
+        for conv_layer, mora_layer in zip(self.conv_layers, self.mora_layers):
+            hidden = conv_layer(hidden)
+            hidden = mora_layer(hidden)
+        
         hidden = hidden.squeeze(2)
-        for layer in self.encoder_layers:
-            hidden = layer(hidden)
+        for encoder_layer, mora_layer in zip(self.encoder_layers, self.mora_layers[len(self.conv_layers):]):
+            hidden = encoder_layer(hidden)
+            hidden = mora_layer(hidden)
+        
         attention_scores = self.softmax(self.attention(hidden))
         context_vector = (attention_scores * hidden).sum(axis=1)
         return context_vector
 
+    # Get all parameters for optimization
     def parameters(self):
         params = []
         for layer in self.conv_layers + self.encoder_layers + [self.attention, self.embedding]:
             if hasattr(layer, 'parameters'):
                 params.extend(layer.parameters())
+        for mora_layer in self.mora_layers:
+            if hasattr(mora_layer, 'high_rank_matrix'):
+                params.append(mora_layer.high_rank_matrix)
         return params
     
+    # Search for the top k relevant documents
     def search(self, query, k=5):
         query_vector = self._encode(query)
         doc_scores = []
@@ -90,8 +120,9 @@ class Retriever:
         top_k_documents = [self.data_store[i] for i in top_k_indices]
         return top_k_documents
     
+    # Train the retriever model
     def train(self, queries, relevant_docs, num_epochs=10, batch_size=32, learning_rate=0.001):
-        optimizer = tinygrad.optim.Adam(self.parameters(), lr=learning_rate)
+        optimizer = optim.Adam(self.parameters(), lr=learning_rate)
         criterion = tinygrad.nn.CrossEntropyLoss()
         
         for epoch in range(num_epochs):
@@ -123,6 +154,7 @@ class Retriever:
             
             print(f"Epoch [{epoch+1}/{num_epochs}], Loss: {epoch_loss/len(queries):.4f}")
     
+    # Evaluate the retriever model
     def evaluate(self, queries, relevant_docs, k=5):
         num_correct = 0
         for query, doc in zip(queries, relevant_docs):
